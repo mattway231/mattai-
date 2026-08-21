@@ -6,6 +6,8 @@ import uuid
 import google.generativeai as genai
 from aiogram import Bot, Dispatcher
 from aiogram.types import InlineQuery, InlineQueryResultArticle, InputTextMessageContent
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web, ClientSession, ClientTimeout
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tg-ai-bot")
@@ -83,11 +85,53 @@ async def handle_inline(query: InlineQuery):
     await query.answer(results, cache_time=1, is_personal=True)
 
 
-async def main():
-    log.info("Бот запущен, режим polling")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+# Render сам даёт публичный домен вида https://ваш-сервис.onrender.com
+# Он придёт как переменная окружения RENDER_EXTERNAL_URL автоматически
+WEBHOOK_PATH = "/webhook"
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
+PORT = int(os.environ.get("PORT", 10000))
+
+
+async def self_ping():
+    """Раз в 10 минут дёргаем свой же публичный URL, чтобы Render
+    не усыплял бесплатный инстанс после 15 минут простоя."""
+    if not BASE_URL:
+        log.warning("BASE_URL не задан — самопинг отключён")
+        return
+    await asyncio.sleep(30)  # даём серверу время подняться
+    async with ClientSession(timeout=ClientTimeout(total=15)) as session:
+        while True:
+            try:
+                async with session.get(BASE_URL) as resp:
+                    log.info(f"Самопинг: {resp.status}")
+            except Exception as e:
+                log.warning(f"Самопинг не удался: {e}")
+            await asyncio.sleep(600)  # 10 минут
+
+
+async def on_startup(app: web.Application):
+    if WEBHOOK_URL and BASE_URL:
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        log.info(f"Webhook установлен: {WEBHOOK_URL}")
+    else:
+        log.warning("RENDER_EXTERNAL_URL не найден, webhook не установлен")
+    asyncio.create_task(self_ping())
+
+
+async def health(request):
+    # чтобы Render видел, что сервис жив, и не считал деплой неудачным
+    return web.Response(text="ok")
+
+
+def main():
+    app = web.Application()
+    app.router.add_get("/", health)
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+    app.on_startup.append(on_startup)
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
